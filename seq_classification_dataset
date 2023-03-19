@@ -1,0 +1,80 @@
+def tokenize_seq_classification_dataset(
+    tokenizer, raw_datasets, task_id, data_args, training_args
+):
+    sentence1_key, sentence2_key = "sentence1", "sentence2"
+
+    # Padding strategy
+    if data_args.pad_to_max_length:
+        padding = "max_length"
+    else:
+        # We will pad later, dynamically at batch creation, to the max sequence length in each batch
+        padding = False
+
+    if data_args.max_seq_length > tokenizer.model_max_length:
+        logger.warning(
+            f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the"
+            f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
+        )
+    max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
+
+    def tokenize_text(examples):
+        args = (
+            (examples[sentence1_key],)
+            if sentence2_key is None
+            else (examples[sentence1_key], examples[sentence2_key])
+        )
+        result = tokenizer(
+            *args, padding=padding, max_length=max_seq_length, truncation=True
+        )
+        examples["labels"] = examples.pop("label")
+        result["task_ids"] = [task_id] * len(examples["labels"])
+        return result
+
+    def tokenize_and_pad_text(examples):
+        result = tokenize_text(examples)
+
+        examples["labels"] = [
+            [l] + [-100] * (max_seq_length - 1) for l in examples["labels"]
+        ]
+        return result
+
+    with training_args.main_process_first(desc="dataset map pre-processing"):
+        col_to_remove = ["idx", sentence1_key, sentence2_key]↴ 
+        train_dataset = raw_datasets["train"].map(
+            tokenize_and_pad_text,
+            batched=True,
+            load_from_cache_file=not data_args.overwrite_cache,
+            remove_columns=col_to_remove,
+            desc="Running tokenizer on dataset",
+        )
+        validation_dataset = raw_datasets["validation"].map(
+            tokenize_text,
+            batched=True,
+            load_from_cache_file=not data_args.overwrite_cache,
+            remove_columns=col_to_remove,
+            desc="Running tokenizer on dataset",
+        )
+
+    return train_dataset, validation_dataset
+
+
+def load_seq_classification_dataset(task_id, tokenizer, data_args, training_args):
+
+    task_name = "mrpc"
+    raw_datasets = load_dataset("glue", task_name, cache_dir=data_args.data_cache_dir)
+
+    num_labels = len(raw_datasets["train"].features["label"].names)
+
+    train_dataset, validation_dataset = tokenize_seq_classification_dataset(
+        tokenizer,
+        raw_datasets,
+        task_id,
+        data_args,
+        training_args,
+    )
+
+    task_info = Task(
+        id=task_id, name=task_name, num_labels=num_labels, type="seq_classification"
+    )
+
+    return train_dataset, validation_dataset, task_info
