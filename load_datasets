@@ -1,0 +1,30 @@
+def load_datasets(tokenizer, data_args, training_args):
+    (
+        seq_classification_train_dataset,
+        seq_classification_validation_dataset,
+        seq_classification_task,
+    ) = load_seq_classification_dataset(0, tokenizer, data_args, training_args)
+    (
+        token_classification_train_dataset,
+        token_classification_validation_dataset,
+        token_classification_task,
+    ) = load_token_classification_dataset(1, tokenizer, data_args, training_args)
+
+    # Merge train datasets
+    train_dataset_df = seq_classification_train_dataset.to_pandas().append(
+        token_classification_train_dataset.to_pandas()
+    )
+    train_dataset = datasets.Dataset.from_pandas(train_dataset_df)
+    train_dataset.shuffle(seed=123)
+
+    # Append validation datasets
+    validation_dataset = [
+        seq_classification_validation_dataset,
+        token_classification_validation_dataset,
+    ]
+
+    dataset = datasets.DatasetDict(
+        {"train": train_dataset, "validation": validation_dataset}
+    )
+    tasks = [seq_classification_task, token_classification_task]
+    return tasks, dataset
