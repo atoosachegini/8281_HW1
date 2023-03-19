@@ -1,0 +1,97 @@
+from typing import Optional
+import numpy as np
+from torch.utils.data import DataLoader
+from transformers import DataCollatorWithPadding, AutoTokenizer, Trainer
+
+from datasets import load_dataset, DatasetDict
+
+
+class TaskSampler:
+    """
+    Class for sampling batches from a dictionary of dataloaders according to a weighted sampling scheme.
+
+    Dynamic task weights can be externally computed and set using the set_task_weights method,
+    or, this class can be extended with methods and state state to implement a more complex sampling scheme.
+
+    You probably/shouldn't need to use this with multiple GPUs, but if you do, you'll may need
+    to extend/debug it yourself since the current implementation is not distributed-aware.
+
+    Args:
+        dataloader_dict (dict[str, DataLoader]): Dictionary of dataloaders to sample from.
+        task_weights (list[float], optional): List of weights for each task. If None, uniform weights are used. Defaults to None.
+        max_iters (int, optional): Maximum number of iterations. If None, infinite. Defaults to None.
+    """
+
+    def __init__(
+        self,
+        *,
+        dataloader_dict: dict[str, DataLoader],
+        task_weights: Optional[dict[str, float]] = None,
+        max_iters=None,
+    ):
+
+        assert dataloader_dict is not None, "Dataloader dictionary must be provided."
+
+        self.dataloader_dict = dataloader_dict
+        self.task_names = list(dataloader_dict.keys())
+        self.dataloader_iterators = self._initialize_iterators()
+
+        self.task_weights = (
+            task_weights if task_weights is not None else self._get_uniform_weights()
+        )
+
+        if type(self.task_weights) != dict:
+            raise TypeError("task_weights must be a dict[str, float]")
+
+        self.current_iter = 0
+        self.max_iters = max_iters if max_iters is not None else float("inf")
+
+    # Initialization methods
+    def _get_uniform_weights(self) -> dict[str, float]:
+        return {name: 1 / len(self.task_names) for name in self.task_names}
+
+    def _initialize_iterators(self):
+        return {
+            name: iter(dataloader) for name, dataloader in self.dataloader_dict.items()
+        }
+
+    # Weight getter and setter methods (NOTE can use these to dynamically set weights)
+    def set_task_weights(self, task_weights: dict[str, float]):
+        np.testing.assert_almost_equal(sum(task_weights.values()), 1.0)
+        self.task_weights = task_weights
+
+    def get_task_weights(self):
+        return self.task_weights
+
+    # Sampling logic
+    def _sample_task(self):
+        weights = [self.task_weights[name] for name in self.task_names]
+        return np.random.choice(self.task_names, p=weights)
+
+    def _sample_batch(self, task):
+        try:
+            return self.dataloader_iterators[task].__next__()
+        except StopIteration:
+            print(f"Restarting iterator for {task}")
+            self.dataloader_iterators[task] = iter(self.dataloader_dict[task])
+            return self.dataloader_iterators[task].__next__()
+        except KeyError as e:
+            print(e)
+            raise KeyError("Task not in dataset dictionary.")
+
+    # Iterable interface
+    def __iter__(self):
+        self.current_iter = 0
+        return self
+
+    def __next__(self):
+        if self.current_iter >= self.max_iters:
+            raise StopIteration
+        else:
+            self.current_iter += 1
+        task = self._sample_task()
+        batch = self._sample_batch(task)
+        return task, batch
+
+    def __len__(self):
+        return self.max_iters
