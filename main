@@ -1,0 +1,160 @@
+import os
+import argparse
+from transformers import AutoModel
+import functools
+import pytorch_lightning as pl
+
+from torchmetrics import functional as FM
+from torchmetrics import MeanMetric
+from transformers.modeling_outputs import SequenceClassifierOutput, TokenClassifierOutput
+import torch
+from torch import nn
+
+
+class PLModule(pl.LightningModule):
+    def __init__(self, hparams, task_configs: dict) -> None:
+        super().__init__()
+        self.save_hyperparameters(hparams)
+
+        self.model = MultitaskModel(hparams.model_spec, task_configs)
+
+        self.metrics_fns = {
+            "ner": {
+                "acc": functools.partial(FM.accuracy, task="multiclass", num_classes=9),
+            },
+            "nli": {
+                "acc": functools.partial(FM.accuracy, task="multiclass", num_classes=3),
+            },
+        }
+
+        self.loss_for_dwa = nn.ModuleDict({task_name: MeanMetric() for task_name in TRAIN_TASKS})
+
+        self.loss_prev = {
+            "ner": None,
+            "nli": None,
+        }
+
+        self.loss_ratios = {
+            "ner": None,
+            "nli": None,
+        }
+
+    def load_model_only(self, ckpt):
+        if type(ckpt) == str:
+            ckpt = torch.load(ckpt)
+        model_state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+        model_only_state_dict = {k.removeprefix("model."): v for k, v in model_state_dict.items()}
+        self.model.load_state_dict(model_only_state_dict)
+
+    def forward(self, task_name: str, batch: dict):
+        return self.model(task_name, batch)
+
+    def training_step(self, batch, batch_idx):
+        task_name, task_batch = batch
+        metrics = self._shared_eval_step(task_name, task_batch, batch_idx)
+
+        self.log_dict(
+            {f"{task_name}_{metric_name}_train": metric_value for metric_name, metric_value in metrics.items()},
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            logger=True,
+        )
+
+        if not self.hparams.enable_dwa:
+            return metrics["loss"]
+
+        assert metrics["loss"].device == self.device
+
+        self.loss_for_dwa[task_name].update(metrics["loss"])
+
+        if (batch_idx + 1) % self.hparams.dwa_every_n_iters == 0:
+
+            loss_scalar = self.loss_for_dwa[task_name].compute().item()
+            if self.loss_prev[task_name] is not None:
+                r_i = loss_scalar / (self.loss_prev[task_name] + 1e-8)
+                self.loss_ratios[task_name] = r_i
+
+            self.loss_prev[task_name] = loss_scalar
+
+        if None not in self.loss_ratios.values():
+            r = torch.tensor([self.loss_ratios[task_name] for task_name in TRAIN_TASKS])
+            r = torch.softmax(r / self.hparams.dwa_temp, dim=0)
+            idx = TASK_IDS[task_name]
+            metrics["w_loss"] = len(TRAIN_TASKS) * metrics["loss"] * r[idx]
+
+            return metrics["w_loss"]
+
+        return metrics["loss"]
+
+    def validation_step(self, batch, batch_idx, dataloader_idx):
+        task_name = TASKS[dataloader_idx]
+        metrics = self._shared_eval_step(task_name, batch, batch_idx)
+        self.log_dict(
+            {f"{task_name}_{metric_name}_val": metric_value for metric_name, metric_value in metrics.items()},
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+            add_dataloader_idx=False,
+        )
+        return metrics
+
+    def _shared_eval_step(self, task_name, batch, batch_idx) -> dict[str, torch.Tensor]:
+        outputs = self.forward(task_name, batch)
+        loss = outputs.loss
+
+        mask = batch["labels"] != -100
+        labels = batch["labels"][mask]
+        preds = outputs.logits.argmax(dim=-1)[mask]
+
+        metrics = {"loss": loss}
+
+        for metric_name, metric_fn in self.metrics_fns[task_name].items():
+            metrics[metric_name] = metric_fn(preds, labels)
+
+        return metrics
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer)
+        return [optimizer], [lr_scheduler]
+
+def main(args: argparse.Namespace):
+
+    seed_everything(args.random_seed)
+
+    train_batch_size = args.batch_size
+    eval_batch_size = args.eval_batch_size or args.batch_size
+
+    task_configs = {
+        "ner": {
+            "train_batch_size": train_batch_size,
+            "eval_batch_size": eval_batch_size,
+            "n_labels": 9,
+        },
+        "nli": {
+            "train_batch_size": train_batch_size,
+            "eval_batch_size": eval_batch_size,
+            "n_labels": 3,
+        },
+    })
+
+    multitask_sampler = prepare_multitask_train_dataloader(task_configs, args.model_spec, args.max_iters)
+    multitask_sampler.set_task_weights({"ner": 1 - args.nli_weight, "nli": args.nli_weight})
+
+    eval_loaders = prepare_dataloaders(task_configs, "val", tokenizer=args.model_spec)
+
+    eval_loaders = None if args.no_val else [*eval_loaders.values()]
+
+    lit_model = LITMultiTaskModule(args, task_configs)
+
+
+    trainer = pl.Trainer(
+        accelerator="auto",
+        devices=1,
+        max_epochs=1,
+        val_check_interval=args.val_every_n_iters,
+    )
+
+    trainer.fit(lit_model, multitask_sampler, val_dataloaders=eval_loaders)
